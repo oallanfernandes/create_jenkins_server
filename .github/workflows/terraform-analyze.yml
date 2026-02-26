@@ -24,7 +24,7 @@ concurrency:
 env:
   TERRAFORM_VERSION: "1.7.0"
   PYTHON_VERSION: "3.11"
-  TF_DIR: "./terraform"           # Diretório raiz dos arquivos .tf
+  TF_DIR: "./deploy_jenkins/terraform"           # Diretório raiz dos arquivos .tf
   TF_VAR_FILE: "environments/prod.tfvars"  # Arquivo de variáveis (opcional)
 
 jobs:
