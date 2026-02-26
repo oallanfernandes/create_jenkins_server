@@ -12,7 +12,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-#Save state in S3 bucket
+#Save state in S3 bucket#
 terraform{
     backend "s3"{
       bucket = "arena-terraform-prod"
