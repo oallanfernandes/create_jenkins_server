@@ -24,7 +24,7 @@ concurrency:
 env:
   TERRAFORM_VERSION: "1.7.0"
   PYTHON_VERSION: "3.11"
-  TF_DIR: "./deploy_jenkins/terraform"           # Diretório raiz dos arquivos .tf
+  TF_DIR: "./terraform"           # Diretório raiz dos arquivos .tf
   TF_VAR_FILE: "environments/prod.tfvars"  # Arquivo de variáveis (opcional)
 
 jobs:
@@ -111,7 +111,7 @@ jobs:
       - name: Instala dependências Python
         run: |
           pip install --upgrade pip
-          pip install anthropic==0.34.0
+          pip install "anthropic==0.40.0" "httpx==0.27.2"
 
       - name: Configure credenciais AWS
         uses: aws-actions/configure-aws-credentials@v4
