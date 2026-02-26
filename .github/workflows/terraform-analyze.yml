@@ -1,0 +1,308 @@
+name: Terraform AI Analysis
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '**.tfvars.json'
+  push:
+    branches:
+      - main
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+
+# Cancela runs anteriores do mesmo PR para economizar recursos
+concurrency:
+  group: terraform-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.7.0"
+  PYTHON_VERSION: "3.11"
+  TF_DIR: "./deploy_jenkins/terraform"           # Diretório raiz dos arquivos .tf
+  TF_VAR_FILE: "environments/prod.tfvars"  # Arquivo de variáveis (opcional)
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1: Valida sintaxe do Terraform antes de gerar o plan
+  # ──────────────────────────────────────────────────────────────────────────
+  terraform-validate:
+    name: "Validate Terraform Syntax"
+    runs-on: ubuntu-latest
+
+    outputs:
+      validation_status: ${{ steps.validate.outputs.status }}
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Histórico completo para diff
+
+      - name: Setup Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false  # Necessário para capturar JSON output limpo
+
+      - name: Configure credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} init \
+            -no-color \
+            -backend=true \
+            -reconfigure
+        env:
+          TF_CLI_ARGS_init: "-upgrade=false"
+
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} fmt -check -recursive -no-color
+        continue-on-error: true  # Aviso, não bloqueia
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} validate -no-color
+          echo "status=success" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2: Gera o plan e faz análise com IA via Claude API
+  # ──────────────────────────────────────────────────────────────────────────
+  terraform-ai-analysis:
+    name: "AI Security & Cost Analysis"
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+    if: needs.terraform-validate.outputs.validation_status == 'success'
+
+    outputs:
+      analysis_result: ${{ steps.analyze.outputs.result }}
+      has_critical: ${{ steps.analyze.outputs.has_critical }}
+      summary: ${{ steps.analyze.outputs.summary }}
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Instala dependências Python
+        run: |
+          pip install --upgrade pip
+          pip install anthropic==0.34.0
+
+      - name: Configure credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Terraform Init
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} init -no-color -backend=true
+
+      - name: Terraform Plan (gera arquivo binário)
+        id: plan
+        run: |
+          PLAN_ARGS="-no-color -out=/tmp/tf_analysis.plan"
+
+          # Adiciona var-file se existir
+          if [ -f "${{ env.TF_DIR }}/${{ env.TF_VAR_FILE }}" ]; then
+            PLAN_ARGS="$PLAN_ARGS -var-file=${{ env.TF_VAR_FILE }}"
+          fi
+
+          terraform -chdir=${{ env.TF_DIR }} plan $PLAN_ARGS 2>&1 | tee /tmp/plan_output.txt
+
+          # Salva exit code do plan (0=sem mudanças, 2=tem mudanças, 1=erro)
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+          echo "plan_exit_code=$PLAN_EXIT_CODE" >> $GITHUB_OUTPUT
+
+          if [ $PLAN_EXIT_CODE -eq 1 ]; then
+            echo "❌ Terraform plan falhou"
+            exit 1
+          fi
+
+      - name: Converte plan para JSON
+        id: plan_json
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} show \
+            -json /tmp/tf_analysis.plan \
+            > /tmp/tf_plan.json
+
+          # Valida que o JSON é válido
+          python3 -c "import json; json.load(open('/tmp/tf_plan.json'))"
+          echo "✅ Plan JSON gerado com sucesso"
+
+          # Mostra estatísticas básicas
+          python3 -c "
+          import json
+          data = json.load(open('/tmp/tf_plan.json'))
+          changes = data.get('resource_changes', [])
+          creates = len([r for r in changes if 'create' in r.get('change',{}).get('actions',[])])
+          updates = len([r for r in changes if 'update' in r.get('change',{}).get('actions',[])])
+          deletes = len([r for r in changes if 'delete' in r.get('change',{}).get('actions',[])])
+          print(f'📊 Mudanças detectadas: {creates} criações | {updates} alterações | {deletes} destruições')
+          "
+
+      - name: Analisa plano com Claude AI
+        id: analyze
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 scripts/analyze_terraform.py \
+            --plan-json /tmp/tf_plan.json \
+            --plan-text /tmp/plan_output.txt \
+            --output /tmp/analysis_result.txt \
+            --github-output "$GITHUB_OUTPUT"
+
+          # Exibe resultado no log
+          echo "════════════════════════════════════════"
+          cat /tmp/analysis_result.txt
+          echo "════════════════════════════════════════"
+
+      - name: Salva artefatos para download
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-analysis-${{ github.run_number }}
+          path: |
+            /tmp/plan_output.txt
+            /tmp/tf_plan.json
+            /tmp/analysis_result.txt
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 3: Posta comentário no PR com o resultado da análise
+  # ──────────────────────────────────────────────────────────────────────────
+  post-pr-comment:
+    name: "Post Analysis to PR"
+    runs-on: ubuntu-latest
+    needs: terraform-ai-analysis
+    if: github.event_name == 'pull_request' && always()
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Download artefatos da análise
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-analysis-${{ github.run_number }}
+          path: /tmp/artifacts
+
+      - name: Posta comentário no Pull Request
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            // Lê o resultado da análise
+            let analysisText = '';
+            try {
+              analysisText = fs.readFileSync('/tmp/artifacts/analysis_result.txt', 'utf8');
+            } catch (e) {
+              analysisText = '⚠️ Não foi possível carregar o resultado da análise.';
+            }
+
+            const hasCritical = '${{ needs.terraform-ai-analysis.outputs.has_critical }}' === 'true';
+            const statusEmoji = hasCritical ? '🚨' : '✅';
+            const statusText = hasCritical
+              ? 'BLOQUEADO - Alertas críticos detectados'
+              : 'APROVADO para apply';
+
+            // Apaga comentário anterior do bot (se existir)
+            const comments = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            for (const comment of comments.data) {
+              if (comment.user.type === 'Bot' &&
+                  comment.body.includes('AI Terraform Analyzer')) {
+                await github.rest.issues.deleteComment({
+                  comment_id: comment.id,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                });
+              }
+            }
+
+            // Posta novo comentário
+            const body = `## ${statusEmoji} AI Terraform Analyzer
+
+            **Status:** \`${statusText}\`
+            **Workflow:** [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            **Commit:** \`${{ github.sha }}\`
+
+            <details>
+            <summary>📋 Análise Completa (clique para expandir)</summary>
+
+            \`\`\`
+            ${analysisText}
+            \`\`\`
+
+            </details>
+
+            ---
+            ${hasCritical
+              ? '> ⛔ **Este PR não deve ser mergeado até que os alertas críticos sejam resolvidos.**'
+              : '> ✅ **Nenhum alerta crítico detectado. Revisar manualmente antes de aplicar.**'
+            }
+
+            <sub>🤖 Análise gerada automaticamente por Claude AI | [Ver artefatos completos](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 4: Bloqueia o merge se houver alertas críticos
+  # ──────────────────────────────────────────────────────────────────────────
+  security-gate:
+    name: "Security Gate"
+    runs-on: ubuntu-latest
+    needs: terraform-ai-analysis
+    if: always()
+
+    steps:
+      - name: Verifica alertas críticos
+        run: |
+          HAS_CRITICAL="${{ needs.terraform-ai-analysis.outputs.has_critical }}"
+
+          if [ "$HAS_CRITICAL" == "true" ]; then
+            echo "🚨 SECURITY GATE: Alertas críticos de segurança detectados!"
+            echo "   O apply foi bloqueado. Resolva os problemas antes de continuar."
+            echo ""
+            echo "Resumo: ${{ needs.terraform-ai-analysis.outputs.summary }}"
+            exit 1
+          else
+            echo "✅ SECURITY GATE: Nenhum alerta crítico. Aprovado para apply."
+          fi
