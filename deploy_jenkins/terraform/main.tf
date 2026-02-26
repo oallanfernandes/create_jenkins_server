@@ -15,7 +15,7 @@ provider "aws" {
 #Save state in S3 bucket#
 terraform{
     backend "s3"{
-      bucket = "arena-terraform-prod"
+      bucket = "l4c-terraform-prod"
       key    = "jenkins-server.tfstate"
       region = "us-east-1"
     }
